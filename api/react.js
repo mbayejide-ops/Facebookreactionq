@@ -19,8 +19,12 @@ module.exports = async (req, res) => {
     let results = { success: 0, failed: 0, logs: [] };
 
     try {
+        // Essential Chromium configuration for Vercel serverless environment
+        chromium.setHeadlessMode = true;
+        chromium.setGraphicsMode = false;
+
         browser = await puppeteer.launch({
-            args: chromium.args,
+            args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process'],
             defaultViewport: chromium.defaultViewport,
             executablePath: await chromium.executablePath(),
             headless: chromium.headless,
@@ -30,7 +34,7 @@ module.exports = async (req, res) => {
         const page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Parse cookies
+        // Parse and inject cookies
         let cookies = [];
         try {
             if (cookieInput.trim().startsWith('[')) {
@@ -42,122 +46,96 @@ module.exports = async (req, res) => {
                 }).filter(c => c.name && c.value);
             }
         } catch (e) {
-            return res.status(400).json({ error: 'Invalid cookie array or string.' });
+            if (browser) await browser.close();
+            return res.status(400).json({ error: 'Invalid cookie array or string format.' });
         }
 
         await page.setCookie(...cookies);
-        results.logs.push('Cookie payload injected into browser instance.');
+        results.logs.push('Cookies injected successfully.');
 
-        // Navigate to modern WWW layout to retrieve profile identity switcher map
+        // Navigate to Facebook to verify authentication state
         await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
         
         if (page.url().includes('login')) {
-            return res.status(401).json({ error: 'Cookie expired or invalid. Facebook redirected to login.' });
+            if (browser) await browser.close();
+            return res.status(401).json({ error: 'Authentication failed. Cookies expired or invalid.' });
         }
 
-        // Fetch user access tokens & page switch IDs using embedded page state
-        results.logs.push('Extracting Page Identity Access Tokens & Profile Switchers...');
-        
-        // Extract Pages list using Graph API tokens / Page Manager dashboard
+        // Fetch user managed pages
+        results.logs.push('Extracting managed page links...');
         await page.goto('https://www.facebook.com/pages/?category=your_pages', { waitUntil: 'networkidle2' });
         
         const managedPages = await page.evaluate((maxLimit) => {
-            const pageElements = Array.from(document.querySelectorAll('a[href*="/meta_dot_com/"], a[href*="profile.php?id="], a[href*="/pages/"]'));
+            const pageElements = Array.from(document.querySelectorAll('a[href*="/profile.php?id="], a[href*="/pages/"], a[href^="https://www.facebook.com/"]'));
             const extracted = [];
             
             for (let el of pageElements) {
                 const href = el.href;
-                // Identify valid page ID or handle
-                if (href && !href.includes('/create/') && !href.includes('/discover/')) {
+                if (href && !href.includes('/create/') && !href.includes('/discover/') && !href.includes('/help/') && !href.includes('/privacy/')) {
                     extracted.push(href);
                 }
             }
             return [...new Set(extracted)].slice(0, maxLimit);
         }, parseInt(limit));
 
-        results.logs.push(`Retrieved ${managedPages.length} unique page profile targets.`);
+        results.logs.push(`Discovered ${managedPages.length} profile targets.`);
 
-        // Target Reaction ID Translation Matrix
-        const reactionMap = {
-            'LIKE': '1',
-            'LOVE': '2',
-            'WOW': '3',
-            'HAHA': '4',
-            'SAD': '7',
-            'ANGRY': '8',
-            'CARE': '16'
-        };
-        const selectedReactionId = reactionMap[reaction.toUpperCase()] || '1';
-
-        // Extract Post ID from URL
-        const postIdMatch = postUrl.match(/(?:fbid=|posts\/|pfbid)([\w\d]+)/);
-        const targetPostId = postIdMatch ? postIdMatch[1] : null;
-
-        if (!targetPostId) {
-            results.logs.push('Warning: Could not isolate exact numeric Post ID. Falling back to DOM automation.');
+        if (managedPages.length === 0) {
+            results.logs.push('Warning: No page links found via dashboard. Falling back to primary profile reaction only.');
+            managedPages.push(postUrl);
         }
 
-        // Execution loop across all 50 Page Identities
+        // Execution loop across page identities
         for (let i = 0; i < managedPages.length; i++) {
             const pageUrl = managedPages[i];
             try {
-                results.logs.push(`[${i + 1}/${managedPages.length}] Switching active identity context to: ${pageUrl}`);
+                results.logs.push(`[${i + 1}/${managedPages.length}] Processing profile context...`);
                 
-                // 1. Context Switch: Navigate directly to page context to execute Identity Switcher
-                await page.goto(pageUrl, { waitUntil: 'networkidle2' });
-                
-                // Attempt identity switch button click on modern layout if switch prompt appears
-                const switched = await page.evaluate(async () => {
-                    const switchBtn = document.querySelector('div[role="button"][aria-label*="Switch"], div[role="button"][aria-label*="সুইচ"]');
-                    if (switchBtn) {
-                        switchBtn.click();
-                        return true;
-                    }
-                    return false;
-                });
+                if (pageUrl !== postUrl) {
+                    await page.goto(pageUrl, { waitUntil: 'networkidle2' });
+                    
+                    // Trigger profile identity switch if context button exists
+                    await page.evaluate(async () => {
+                        const switchBtn = document.querySelector('div[role="button"][aria-label*="Switch"], div[role="button"][aria-label*="সুইচ"]');
+                        if (switchBtn) {
+                            switchBtn.click();
+                        }
+                    });
 
-                if (switched) {
-                    results.logs.push(`[${i + 1}] Successfully triggered profile switch context.`);
-                    await page.waitForTimeout(3000); // Wait for identity switch session token update
+                    await new Promise(r => setTimeout(r, 2000));
                 }
 
-                // 2. Navigate to target post under newly switched page identity
+                // Navigate to target post
                 await page.goto(postUrl, { waitUntil: 'networkidle2' });
 
-                // 3. Dispatch specific reaction without toggling
-                const reactionResult = await page.evaluate(async (reactId, reactType) => {
-                    // Check if already reacted to avoid untoggling/unlike loop
+                // Execute targeted reaction click
+                const reactionResult = await page.evaluate(async (targetReaction) => {
+                    // Check if already reacted to prevent untoggling
                     const activeReactBtn = document.querySelector('div[aria-label="Remove Like"], div[aria-label="Remove Reaction"], [aria-label*="Unlike"]');
                     if (activeReactBtn) {
-                        return { status: 'skipped', reason: 'Identity already reacted to this target.' };
+                        return { status: 'skipped', reason: 'Already reacted under this identity.' };
                     }
 
-                    // Hover/Long press over Reaction trigger
                     const likeButton = document.querySelector('div[aria-label="Like"], div[aria-label="লাইক"], div[role="button"][aria-label*="Like"]');
-                    
                     if (likeButton) {
-                        // Trigger mouseover to reveal full reaction dock (Like, Love, Haha, Care, etc.)
                         likeButton.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                        await new Promise(r => setTimeout(r, 1000));
+                        await new Promise(r => setTimeout(r, 800));
 
-                        // Find targeted reaction inside flyout panel
-                        const targetReactEl = document.querySelector(`div[aria-label="${reactType}"], div[role="button"][aria-label*="${reactType}"]`);
-                        
+                        const targetReactEl = document.querySelector(`div[aria-label="${targetReaction}"], div[role="button"][aria-label*="${targetReaction}"]`);
                         if (targetReactEl) {
                             targetReactEl.click();
-                            return { status: 'success', method: 'dock_click' };
+                            return { status: 'success', method: 'dock_reaction' };
                         } else {
-                            // Fallback to direct click if standard Like selected
                             likeButton.click();
-                            return { status: 'success', method: 'direct_click' };
+                            return { status: 'success', method: 'direct_like' };
                         }
                     }
-                    return { status: 'failed', reason: 'Reaction DOM triggers not found.' };
-                }, selectedReactionId, reaction.toUpperCase());
+                    return { status: 'failed', reason: 'Reaction DOM button not found.' };
+                }, reaction.toUpperCase());
 
                 if (reactionResult.status === 'success') {
                     results.success++;
-                    results.logs.push(`[${i + 1}] Reaction [${reaction}] successfully recorded via ${reactionResult.method}.`);
+                    results.logs.push(`[${i + 1}] Reaction [${reaction.toUpperCase()}] applied via ${reactionResult.method}.`);
                 } else if (reactionResult.status === 'skipped') {
                     results.logs.push(`[${i + 1}] Skipped: ${reactionResult.reason}`);
                 } else {
@@ -167,7 +145,7 @@ module.exports = async (req, res) => {
 
             } catch (err) {
                 results.failed++;
-                results.logs.push(`[${i + 1}] Error during page context execution: ${err.message}`);
+                results.logs.push(`[${i + 1}] Iteration error: ${err.message}`);
             }
         }
 
