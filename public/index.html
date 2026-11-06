@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FB Multi-Page Reactor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 font-mono min-h-screen p-6">
+    <div class="max-w-2xl mx-auto bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-xl">
+        <h1 class="text-xl font-bold mb-4 text-emerald-400">FB Multi-Page Reactor Matrix</h1>
+        
+        <form id="reactForm" class="space-y-4">
+            <div>
+                <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">Facebook Cookie (c_user, xs)</label>
+                <textarea name="cookie" rows="3" required placeholder="Paste full cookie string or JSON array here..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"></textarea>
+            </div>
+            
+            <div>
+                <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">Target Post URL</label>
+                <input type="url" name="postUrl" required placeholder="https://www.facebook.com/permalink.php?story_fbid=..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">Reaction Type</label>
+                    <select name="reaction" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+                        <option value="LIKE">LIKE</option>
+                        <option value="LOVE">LOVE</option>
+                        <option value="CARE">CARE</option>
+                        <option value="HAHA">HAHA</option>
+                        <option value="WOW">WOW</option>
+                        <option value="SAD">SAD</option>
+                        <option value="ANGRY">ANGRY</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">Max Pages to Deploy</label>
+                    <input type="number" name="limit" value="50" max="50" min="1" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+                </div>
+            </div>
+
+            <button type="submit" id="submitBtn" class="w-full bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold py-2 rounded transition-colors">
+                Execute Dispatch
+            </button>
+        </form>
+
+        <div id="status" class="mt-4 hidden p-3 rounded bg-slate-950 border border-slate-800 text-xs text-slate-300 whitespace-pre-wrap"></div>
+    </div>
+
+    <script>
+        document.getElementById('reactForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const status = document.getElementById('status');
+            btn.disabled = true;
+            btn.textContent = 'Deploying Puppeteer Engine...';
+            status.classList.remove('hidden');
+            status.textContent = 'Initializing serverless chromium instance...\n';
+
+            const formData = Object.fromEntries(new FormData(e.target));
+
+            try {
+                const res = await fetch('/api/react', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
+                });
+                const data = await res.json();
+                status.textContent += JSON.stringify(data, null, 2);
+            } catch (err) {
+                status.textContent += `Error: ${err.message}`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Execute Dispatch';
+            }
+        });
+    </script>
+</body>
+                          </html>
