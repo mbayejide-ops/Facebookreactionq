@@ -1,7 +1,13 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/react.js", "use": "@vercel/node" }
+    {
+      "src": "api/react.js",
+      "use": "@vercel/node",
+      "config": {
+        "maxDuration": 60
+      }
+    }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/react.js" }
