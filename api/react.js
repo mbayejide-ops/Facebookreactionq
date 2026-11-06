@@ -1,6 +1,36 @@
 // language: JavaScript, file: api/react.js, target: Vercel Serverless Function
-const chromium = require('@sparticuz/chromium');
-const puppeteer = require('puppeteer-core');
+const https = require('https');
+
+function makeRequest(url, headers, postData = null) {
+    return new Promise((resolve, reject) => {
+        const urlObj = new URL(url);
+        const options = {
+            hostname: urlObj.hostname,
+            path: urlObj.pathname + urlObj.search,
+            method: postData ? 'POST' : 'GET',
+            headers: headers
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+        });
+
+        req.on('error', err => reject(err));
+        if (postData) req.write(postData);
+        req.end();
+    });
+}
+
+function extractPostId(url) {
+    const match = url.match(/(?:fbid=|posts\/|pfbid|story_fbid=)([\w\d]+)/);
+    if (match) return match[1];
+    // Fallback match for numeric IDs in URL paths
+    const parts = url.split('/');
+    const numericPart = parts.find(p => /^\d+$/.test(p));
+    return numericPart || null;
+}
 
 module.exports = async (req, res) => {
     if (req.method !== 'POST') {
@@ -15,145 +45,103 @@ module.exports = async (req, res) => {
         return res.status(400).json({ error: 'Missing required inputs: cookie or postUrl' });
     }
 
-    let browser = null;
     let results = { success: 0, failed: 0, logs: [] };
 
     try {
-        // Essential Chromium configuration for Vercel serverless environment
-        chromium.setHeadlessMode = true;
-        chromium.setGraphicsMode = false;
+        const headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Cookie': cookieInput,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5'
+        };
 
-        browser = await puppeteer.launch({
-            args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process'],
-            defaultViewport: chromium.defaultViewport,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-            ignoreHTTPSErrors: true,
-        });
+        results.logs.push('Fetching Facebook home dashboard to extract user & page tokens...');
+        const homeRes = await makeRequest('https://www.facebook.com/', headers);
 
-        const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-        // Parse and inject cookies
-        let cookies = [];
-        try {
-            if (cookieInput.trim().startsWith('[')) {
-                cookies = JSON.parse(cookieInput);
-            } else {
-                cookies = cookieInput.split(';').map(c => {
-                    const [name, ...val] = c.trim().split('=');
-                    return { name: name.trim(), value: val.join('=').trim(), domain: '.facebook.com', path: '/' };
-                }).filter(c => c.name && c.value);
-            }
-        } catch (e) {
-            if (browser) await browser.close();
-            return res.status(400).json({ error: 'Invalid cookie array or string format.' });
-        }
-
-        await page.setCookie(...cookies);
-        results.logs.push('Cookies injected successfully.');
-
-        // Navigate to Facebook to verify authentication state
-        await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
-        
-        if (page.url().includes('login')) {
-            if (browser) await browser.close();
+        if (homeRes.body.includes('/login/') || homeRes.statusCode === 302 && homeRes.headers.location?.includes('login')) {
             return res.status(401).json({ error: 'Authentication failed. Cookies expired or invalid.' });
         }
 
-        // Fetch user managed pages
-        results.logs.push('Extracting managed page links...');
-        await page.goto('https://www.facebook.com/pages/?category=your_pages', { waitUntil: 'networkidle2' });
-        
-        const managedPages = await page.evaluate((maxLimit) => {
-            const pageElements = Array.from(document.querySelectorAll('a[href*="/profile.php?id="], a[href*="/pages/"], a[href^="https://www.facebook.com/"]'));
-            const extracted = [];
-            
-            for (let el of pageElements) {
-                const href = el.href;
-                if (href && !href.includes('/create/') && !href.includes('/discover/') && !href.includes('/help/') && !href.includes('/privacy/')) {
-                    extracted.push(href);
-                }
-            }
-            return [...new Set(extracted)].slice(0, maxLimit);
-        }, parseInt(limit));
+        // Extract fb_dtsg token required for graph mutations
+        const dtsgMatch = homeRes.body.match(/"DTSGInitialData"\s*,\s*\[\s*\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/);
+        const fbDtsg = dtsgMatch ? dtsgMatch[1] : null;
 
-        results.logs.push(`Discovered ${managedPages.length} profile targets.`);
+        const userIdMatch = cookieInput.match(/c_user=(\d+)/);
+        const userId = userIdMatch ? userIdMatch[1] : null;
 
-        if (managedPages.length === 0) {
-            results.logs.push('Warning: No page links found via dashboard. Falling back to primary profile reaction only.');
-            managedPages.push(postUrl);
+        if (!fbDtsg || !userId) {
+            return res.status(400).json({ error: 'Failed to extract security tokens (fb_dtsg or c_user).' });
         }
 
-        // Execution loop across page identities
-        for (let i = 0; i < managedPages.length; i++) {
-            const pageUrl = managedPages[i];
+        results.logs.push(`Extracted user ID: ${userId} and security token.`);
+
+        // Extract managed pages via mobile graph parser
+        results.logs.push('Extracting managed page identities...');
+        const mbasicRes = await makeRequest('https://mbasic.facebook.com/pages/?category=your_pages', headers);
+        
+        const pageMatches = [...mbasicRes.body.matchAll(/\/profile\.php\?id=(\d+)/g)].map(m => m[1]);
+        const uniquePages = [...new Set(pageMatches)].slice(0, parseInt(limit));
+
+        results.logs.push(`Discovered ${uniquePages.length} unique page identities.`);
+
+        if (uniquePages.length === 0) {
+            uniquePages.push(userId); // Fallback to primary account if no pages found
+        }
+
+        const targetPostId = extractPostId(postUrl);
+        if (!targetPostId) {
+            return res.status(400).json({ error: 'Could not parse target post ID from URL.' });
+        }
+
+        // Reaction mapping types
+        const reactionTypeMap = { 'LIKE': 1, 'LOVE': 2, 'WOW': 3, 'HAHA': 4, 'SAD': 7, 'ANGRY': 8, 'CARE': 16 };
+        const reactionType = reactionTypeMap[reaction.toUpperCase()] || 1;
+
+        // Dispatch reactions across profiles/pages
+        for (let i = 0; i < uniquePages.length; i++) {
+            const pageId = uniquePages[i];
             try {
-                results.logs.push(`[${i + 1}/${managedPages.length}] Processing profile context...`);
-                
-                if (pageUrl !== postUrl) {
-                    await page.goto(pageUrl, { waitUntil: 'networkidle2' });
-                    
-                    // Trigger profile identity switch if context button exists
-                    await page.evaluate(async () => {
-                        const switchBtn = document.querySelector('div[role="button"][aria-label*="Switch"], div[role="button"][aria-label*="সুইচ"]');
-                        if (switchBtn) {
-                            switchBtn.click();
+                results.logs.push(`[${i + 1}/${uniquePages.length}] Dispatching reaction for identity: ${pageId}`);
+
+                // Graph API reaction endpoint payload simulation
+                const postData = new URLSearchParams({
+                    av: pageId,
+                    fb_dtsg: fbDtsg,
+                    doc_id: '3336399999745581', // Facebook feedback mutation graph hash
+                    variables: JSON.stringify({
+                        input: {
+                            feedback_id: targetPostId,
+                            tracking: [],
+                            feedback_source: 'OBJECT_FEED',
+                            actor_id: pageId,
+                            client_mutation_id: Math.random().toString()
                         }
-                    });
+                    })
+                }).toString();
 
-                    await new Promise(r => setTimeout(r, 2000));
-                }
+                const reactionRes = await makeRequest('https://www.facebook.com/api/graphql/', {
+                    ...headers,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-FB-Friendly-Name': 'CometUFICreatorFeedbackReactionMutation'
+                }, postData);
 
-                // Navigate to target post
-                await page.goto(postUrl, { waitUntil: 'networkidle2' });
-
-                // Execute targeted reaction click
-                const reactionResult = await page.evaluate(async (targetReaction) => {
-                    // Check if already reacted to prevent untoggling
-                    const activeReactBtn = document.querySelector('div[aria-label="Remove Like"], div[aria-label="Remove Reaction"], [aria-label*="Unlike"]');
-                    if (activeReactBtn) {
-                        return { status: 'skipped', reason: 'Already reacted under this identity.' };
-                    }
-
-                    const likeButton = document.querySelector('div[aria-label="Like"], div[aria-label="লাইক"], div[role="button"][aria-label*="Like"]');
-                    if (likeButton) {
-                        likeButton.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                        await new Promise(r => setTimeout(r, 800));
-
-                        const targetReactEl = document.querySelector(`div[aria-label="${targetReaction}"], div[role="button"][aria-label*="${targetReaction}"]`);
-                        if (targetReactEl) {
-                            targetReactEl.click();
-                            return { status: 'success', method: 'dock_reaction' };
-                        } else {
-                            likeButton.click();
-                            return { status: 'success', method: 'direct_like' };
-                        }
-                    }
-                    return { status: 'failed', reason: 'Reaction DOM button not found.' };
-                }, reaction.toUpperCase());
-
-                if (reactionResult.status === 'success') {
+                if (reactionRes.statusCode === 200) {
                     results.success++;
-                    results.logs.push(`[${i + 1}] Reaction [${reaction.toUpperCase()}] applied via ${reactionResult.method}.`);
-                } else if (reactionResult.status === 'skipped') {
-                    results.logs.push(`[${i + 1}] Skipped: ${reactionResult.reason}`);
+                    results.logs.push(`[${i + 1}] Reaction successfully dispatched.`);
                 } else {
                     results.failed++;
-                    results.logs.push(`[${i + 1}] Failed: ${reactionResult.reason}`);
+                    results.logs.push(`[${i + 1}] Failed with status code: ${reactionRes.statusCode}`);
                 }
 
             } catch (err) {
                 results.failed++;
-                results.logs.push(`[${i + 1}] Iteration error: ${err.message}`);
+                results.logs.push(`[${i + 1}] Error: ${err.message}`);
             }
         }
 
-        await browser.close();
         return res.status(200).json({ status: 'completed', results });
 
     } catch (err) {
-        if (browser) await browser.close();
         return res.status(500).json({ error: err.message, logs: results.logs });
     }
 };
